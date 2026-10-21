@@ -1,0 +1,9 @@
+# PlatformIO build output and caches
+.pio/
+.vscode/
+
+# Android build output, signed packages and signing keys
+zin-app/build/
+*.apk
+*.keystore
+*.idsig
