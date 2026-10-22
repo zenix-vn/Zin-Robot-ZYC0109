@@ -3,6 +3,10 @@ package com.zin.robot;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
@@ -12,10 +16,16 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
 import android.text.InputType;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
@@ -27,13 +37,20 @@ import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 
+import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends Activity implements BleLink.Listener {
-    private static final String[] MODE_NAMES = { "Lái tay", "Tránh vật", "Dò line", "Bám theo" };
-    private static final String[] MODE_HUD = { "Lái tay", "Tránh vật cản", "Dò line", "Bám theo" };
-    private static final int[] MODE_ICONS = { R.drawable.ic_wheel, R.drawable.ic_radar, R.drawable.ic_route, R.drawable.ic_target };
-    private static final int[] MODE_COLORS = { Ui.ACCENT, 0xFF14B8D4, 0xFFF08A24, 0xFFE0559A };
+    private static final String[] MODE_NAMES = { "Lái tay", "Tránh vật", "Dò line", "Bám theo", "Canh gác" };
+    private static final String[] MODE_HUD = { "Lái tay", "Tránh vật cản", "Dò line", "Bám theo", "Canh gác" };
+    private static final int[] MODE_ICONS = { R.drawable.ic_wheel, R.drawable.ic_radar, R.drawable.ic_route, R.drawable.ic_target,
+            R.drawable.ic_shield };
+    private static final int[] MODE_COLORS = { Ui.ACCENT, 0xFF14B8D4, 0xFFF08A24, 0xFFE0559A, Ui.VIOLET };
+    private static final int MODES = MODE_NAMES.length;
+    private static final int STYLE_JOY = 0, STYLE_TANK = 1, STYLE_TILT = 2;
+    private static final int PERM_VOICE = 2, PERM_DANCE = 3, PERM_NOTIFY = 4;
+    private static final int[] DANCE_STEPS = { 0, 1, 0, 1, 4, 5, 4, 5, 2, 3, 1, 0 };   // firmware #X moves
+    private static final String ALARM_CHANNEL = "alarm";
     private static final int[] SPEEDS = { 40, 70, 100 };
     private static final String[] SPEED_NAMES = { "Chậm", "Vừa", "Nhanh" };
     private static final int SPIN = 70;
@@ -51,14 +68,34 @@ public class MainActivity extends Activity implements BleLink.Listener {
     private Tile radarToggle;
     private Tile camBtn, flashBtn, headBtn;
     private SeekBar panBar;
-    private final Tile[] modeTiles = new Tile[4];
+    private final Tile[] modeTiles = new Tile[MODES];
     private final LinearLayout[] speedPills = new LinearLayout[3];
-    private LinearLayout styleJoy, styleTank;
-    private View joyPane, tankPane;
+    private final LinearLayout[] stylePills = new LinearLayout[3];
+    private View joyPane, tankPane, tiltPane;
     private JoystickView joy, tankL, tankR;
+    private TiltPad tilt;
     private TelemetryView telemetry;
+    private Tile voiceTile, danceTile, colorTile, faceTile;
 
-    private boolean tankMode, camLed, headlight;
+    private int style;
+    private boolean camLed, headlight;
+
+    // voice: a timed manoeuvre ("rẽ trái" drives for a moment)
+    private SpeechRecognizer speech;
+    private boolean listening;
+    private int voiceT, voiceS;
+    private long voiceUntil;
+
+    // dance
+    private BeatDetector beats;
+    private int danceStep;
+
+    // tracking (colour / face) with the camera on the pan servo
+    private Vision vision;
+    private Vision.Result target;
+    private int trackPan = 95;
+    private long targetSeen, lastPanCmd;
+    private boolean pickColor;
     private int robotMode = -1;    // from telemetry; -1 = unknown
     private int spin;              // +1 spin left, -1 spin right, 0 none
     private int stopBurst;
@@ -72,21 +109,29 @@ public class MainActivity extends Activity implements BleLink.Listener {
         getWindow().setStatusBarColor(Ui.BG2);
         getWindow().setNavigationBarColor(Ui.BG);
         prefs = getSharedPreferences("robot", MODE_PRIVATE);
-        tankMode = prefs.getBoolean("tank", false);
+        style = prefs.getInt("style", prefs.getBoolean("tank", false) ? STYLE_TANK : STYLE_JOY);
         headlight = prefs.getBoolean("headlight", true);
         link = new BleLink(this, this);
+        beats = new BeatDetector(this::onBeat);
+        vision = new Vision(this::onVision);
         setContentView(buildUi());
-        selectStyle(tankMode);
+        camera.setFrameListener(vision::onFrame);
+        selectStyle(style);
         selectSpeed(prefs.getInt("speed", 1));
         showMode(-1);
         headBtn.setActive(headlight);
         if (!hasPerms()) requestPermissions(neededPerms(), 1);
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel ch = new NotificationChannel(ALARM_CHANNEL, "Báo động canh gác", NotificationManager.IMPORTANCE_HIGH);
+            getSystemService(NotificationManager.class).createNotificationChannel(ch);
+        }
     }
 
     @Override protected void onResume() {
         super.onResume();
         if (hasPerms()) link.start();
-        if (prefs.getBoolean("cam_on", true)) startCamera();
+        if (prefs.getBoolean("cam_on", true) || vision.mode() != Vision.OFF) startCamera();
+        tilt.listen(style == STYLE_TILT);
         ui.removeCallbacks(tick);
         ui.post(tick);
     }
@@ -96,10 +141,16 @@ public class MainActivity extends Activity implements BleLink.Listener {
         ui.removeCallbacks(tick);
         camera.stop();
         camBtn.setActive(false);
+        tilt.listen(false);
+        stopDance();
+        stopTracking();
+        if (speech != null) speech.cancel();
+        setListening(false);
         super.onPause();
     }
 
     @Override protected void onDestroy() {
+        if (speech != null) speech.destroy();
         link.stop();
         super.onDestroy();
     }
@@ -118,6 +169,10 @@ public class MainActivity extends Activity implements BleLink.Listener {
     }
 
     @Override public void onRequestPermissionsResult(int code, String[] p, int[] r) {
+        boolean granted = r.length > 0 && r[0] == PackageManager.PERMISSION_GRANTED;
+        if (code == PERM_VOICE) { if (granted) startListening(); else toast("Cần quyền micro để nghe lệnh"); return; }
+        if (code == PERM_DANCE) { if (granted) startDance(); else toast("Cần quyền micro để nghe nhạc"); return; }
+        if (code == PERM_NOTIFY) return;
         if (hasPerms()) link.start();
         else subtitle.setText("Cần quyền Bluetooth và Vị trí để tìm robot");
     }
@@ -240,6 +295,11 @@ public class MainActivity extends Activity implements BleLink.Listener {
         camBox.setBackground(Ui.round(0xFF02050C, dp(24)));
         camera = new MjpegView(this);
         camBox.addView(camera, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        camera.setOnTouchListener((v, e) -> {   // colour tracking: tap the thing to follow
+            if (e.getActionMasked() != MotionEvent.ACTION_UP || vision.mode() != Vision.COLOR) return true;
+            pickColorAt(e.getX(), e.getY());
+            return true;
+        });
         radar = new RadarView(this);
         radar.setVisibility(View.GONE);
         camBox.addView(radar, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -253,11 +313,14 @@ public class MainActivity extends Activity implements BleLink.Listener {
         });
         flashBtn = new Tile(this, R.drawable.ic_flash, null, true, 20);
         flashBtn.setActiveColor(Ui.YELLOW);
-        flashBtn.setOnClickListener(v -> {
+        flashBtn.setOnClickListener(v -> {   // tap: on / off, hold: brightness, effect, automatic
             v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-            camLed = !camLed;
-            camera.setLed(camAddress(), camLed);
-            flashBtn.setActive(camLed);
+            setFlash(!camLed);
+        });
+        flashBtn.setOnLongClickListener(v -> {
+            v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            showFlashPanel();
+            return true;
         });
         headBtn = new Tile(this, R.drawable.ic_headlight, null, true, 20);
         headBtn.setActiveColor(0xFF5B8CFF);
@@ -329,30 +392,51 @@ public class MainActivity extends Activity implements BleLink.Listener {
 
         // ---- modes
         LinearLayout modes = hbox();
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < MODES; i++) {
             final int m = i;
             modeTiles[i] = new Tile(this, MODE_ICONS[i], MODE_NAMES[i], false, 22);
             modeTiles[i].setActiveColor(MODE_COLORS[i]);
             modeTiles[i].setOnClickListener(v -> {
                 v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-                if (link.ready()) link.send("#A" + m);
-                showMode(m);
+                setRobotMode(m);
             });
-            modes.addView(modeTiles[i], margins(weight(1, 66), i == 0 ? 0 : 4, 0, i == 3 ? 0 : 4, 0));
+            modes.addView(modeTiles[i], margins(weight(1, 66), i == 0 ? 0 : 3, 0, i == MODES - 1 ? 0 : 3, 0));
         }
+        modeTiles[4].setOnLongClickListener(v -> { showAlarmHistory(); return true; });
         root.addView(modes, margins(lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 12, 0, 0));
+
+        // ---- extra features: voice, dance, colour / face tracking
+        LinearLayout feats = hbox();
+        voiceTile = new Tile(this, R.drawable.ic_mic, "Giọng nói", false, 22);
+        voiceTile.setActiveColor(Ui.GREEN);
+        voiceTile.setOnClickListener(v -> { v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY); toggleListening(); });
+        voiceTile.setOnLongClickListener(v -> { showVoiceHelp(); return true; });
+        danceTile = new Tile(this, R.drawable.ic_music, "Nhảy", false, 22);
+        danceTile.setActiveColor(Ui.PINK);
+        danceTile.setOnClickListener(v -> { v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY); toggleDance(); });
+        colorTile = new Tile(this, R.drawable.ic_palette, "Bám màu", false, 22);
+        colorTile.setActiveColor(Ui.ORANGE);
+        colorTile.setOnClickListener(v -> { v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY); toggleTracking(Vision.COLOR); });
+        faceTile = new Tile(this, R.drawable.ic_face, "Bám mặt", false, 22);
+        faceTile.setActiveColor(Ui.CYAN);
+        faceTile.setOnClickListener(v -> { v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY); toggleTracking(Vision.FACE); });
+        Tile[] ft = { voiceTile, danceTile, colorTile, faceTile };
+        for (int i = 0; i < ft.length; i++)
+            feats.addView(ft[i], margins(weight(1, 66), i == 0 ? 0 : 3, 0, i == ft.length - 1 ? 0 : 3, 0));
+        root.addView(feats, margins(lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 8, 0, 0));
 
         // ---- control deck
         LinearLayout deck = card(12);
-        LinearLayout opts = hbox();
-        LinearLayout style = segmented();
-        styleJoy = pill(R.drawable.ic_joystick, "Joystick");
-        styleTank = pill(R.drawable.ic_tank, "Hai bên");
-        style.addView(styleJoy, weight(1, 34));
-        style.addView(styleTank, weight(1, 34));
-        styleJoy.setOnClickListener(v -> selectStyle(false));
-        styleTank.setOnClickListener(v -> selectStyle(true));
-        opts.addView(style, weight(1.15f, 0));
+        LinearLayout styleBar = segmented();
+        stylePills[STYLE_JOY] = pill(R.drawable.ic_joystick, "Joystick");
+        stylePills[STYLE_TANK] = pill(R.drawable.ic_tank, "Hai bên");
+        stylePills[STYLE_TILT] = pill(R.drawable.ic_tilt, "Nghiêng");
+        for (int i = 0; i < 3; i++) {
+            final int st = i;
+            stylePills[i].setOnClickListener(v -> selectStyle(st));
+            styleBar.addView(stylePills[i], weight(1, 34));
+        }
+        deck.addView(styleBar);
         LinearLayout speed = segmented();
         for (int i = 0; i < 3; i++) {
             final int s = i;
@@ -360,8 +444,7 @@ public class MainActivity extends Activity implements BleLink.Listener {
             speedPills[i].setOnClickListener(v -> selectSpeed(s));
             speed.addView(speedPills[i], weight(1, 34));
         }
-        opts.addView(speed, margins(weight(1, 0), 8, 0, 0, 0));
-        deck.addView(opts);
+        deck.addView(speed, margins(lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 8, 0, 0));
 
         FrameLayout controls = new FrameLayout(this);
         deck.addView(controls, margins(lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(212)), 0, 10, 0, 0));
@@ -409,6 +492,22 @@ public class MainActivity extends Activity implements BleLink.Listener {
         tp.addView(tankR, weight(1, 0));
         tankPane = tp;
         controls.addView(tp, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // tilt: hold-to-drive pad left, stop + horn right
+        LinearLayout lp2 = hbox();
+        tilt = new TiltPad(this);
+        tilt.setListener(on -> { if (!on && !anyStickActive()) { stopBurst = 3; if (link.ready()) link.send("#S"); } });
+        lp2.addView(tilt, weight(1.3f, 0));
+        LinearLayout tmid = vbox();
+        tmid.setGravity(Gravity.CENTER);
+        tmid.addView(stopButton(), lp(dp(100), dp(100)));
+        Tile horn3 = new Tile(this, R.drawable.ic_horn, null, true, 22);
+        horn3.setActiveColor(Ui.ORANGE);
+        horn3.onHold(this::horn);
+        tmid.addView(horn3, margins(lp(dp(50), dp(50)), 0, 16, 0, 0));
+        lp2.addView(tmid, weight(1, 0));
+        tiltPane = lp2;
+        controls.addView(lp2, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         root.addView(deck, margins(lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 12, 0, 0));
 
         // ---- telemetry
@@ -444,6 +543,9 @@ public class MainActivity extends Activity implements BleLink.Listener {
             v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
             spin = 0;
             stopBurst = 0;
+            voiceUntil = 0;
+            stopDance();
+            stopTracking();
             panBar.setProgress(80);
             if (link.ready()) { link.send("#R"); link.send("#R"); }   // rest pose: stopped, wheels and camera straight
         });
@@ -452,13 +554,15 @@ public class MainActivity extends Activity implements BleLink.Listener {
 
     // ------------------------------------------------------------------ UI state
 
-    private void selectStyle(boolean tank) {
-        tankMode = tank;
-        prefs.edit().putBoolean("tank", tank).apply();
-        setPill(styleJoy, !tank, Ui.ACCENT);
-        setPill(styleTank, tank, Ui.ACCENT);
-        joyPane.setVisibility(tank ? View.GONE : View.VISIBLE);
-        tankPane.setVisibility(tank ? View.VISIBLE : View.GONE);
+    private void selectStyle(int st) {
+        style = st;
+        prefs.edit().putInt("style", st).apply();
+        for (int i = 0; i < 3; i++) setPill(stylePills[i], i == st, Ui.ACCENT);
+        joyPane.setVisibility(st == STYLE_JOY ? View.VISIBLE : View.GONE);
+        tankPane.setVisibility(st == STYLE_TANK ? View.VISIBLE : View.GONE);
+        tiltPane.setVisibility(st == STYLE_TILT ? View.VISIBLE : View.GONE);
+        tilt.listen(st == STYLE_TILT);
+        if (st == STYLE_TILT && !tilt.available()) toast("Máy không có cảm biến nghiêng");
     }
 
     private void selectSpeed(int i) {
@@ -468,7 +572,16 @@ public class MainActivity extends Activity implements BleLink.Listener {
     }
 
     private void showMode(int m) {
-        for (int k = 0; k < 4; k++) modeTiles[k].setActive(k == m);
+        for (int k = 0; k < MODES; k++) modeTiles[k].setActive(k == m);
+    }
+
+    private void setRobotMode(int m) {
+        if (m != 0) { stopDance(); stopTracking(); voiceUntil = 0; }
+        if (m == 4 && Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS }, PERM_NOTIFY);
+        if (link.ready()) link.send("#A" + m);
+        showMode(m);
     }
 
     private String camAddress() { return prefs.getString("cam_url", DEFAULT_CAM); }
@@ -489,7 +602,8 @@ public class MainActivity extends Activity implements BleLink.Listener {
     }
 
     private boolean anyStickActive() {
-        return tankMode ? tankL.isActive() || tankR.isActive() : joy.isActive();
+        return style == STYLE_TANK ? tankL.isActive() || tankR.isActive()
+             : style == STYLE_TILT ? tilt.isActive() : joy.isActive();
     }
 
     private void setSpin(int s) {
@@ -501,6 +615,137 @@ public class MainActivity extends Activity implements BleLink.Listener {
 
     private void sendPan() {
         if (link.ready()) link.send("#P" + (175 - panBar.getProgress()));   // slide right = look right
+    }
+
+    private void setFlash(boolean on) {
+        camLed = on;
+        flashBtn.setActive(on);
+        sendFlash();
+    }
+
+    /**
+     * Camera flash goes over Bluetooth (the robot passes it on to the ESP32-CAM by wire, so the camera
+     * view or its Wi-Fi is not needed) and also over Wi-Fi in case the robot's Bluetooth is not connected.
+     */
+    private void sendFlash() {
+        int level = camLed ? prefs.getInt("flash_level", 100) : 0;
+        int fx = prefs.getInt("flash_fx", 0);
+        boolean auto = camLed && prefs.getBoolean("flash_auto", false);
+        if (link.ready()) link.send("#F" + level + "," + fx + (auto ? ",1" : ""));
+        if (!auto || !link.ready()) camera.setFlash(camAddress(), level, auto ? 0 : fx);
+    }
+
+    private final Runnable flashSend = this::sendFlash;
+
+    private void sendHornAuto() {
+        if (link.ready()) link.send(prefs.getBoolean("horn_auto", false) ? "#K1" : "#K0");
+    }
+
+    private void showFlashPanel() {
+        LinearLayout box = vbox();
+        box.setPadding(dp(24), dp(8), dp(24), dp(4));
+        box.addView(Ui.text(this, "Chạm nút tia sét để bật/tắt, giữ để mở bảng này. Lệnh đi qua Bluetooth nên không cần mở camera.",
+                13, Ui.MUTED, null));
+
+        final LinearLayout control = segmented();
+        final LinearLayout manualPill = pill(0, "Thủ công"), autoPill = pill(R.drawable.ic_flash, "Tự động");
+        control.addView(manualPill, weight(1, 34));
+        control.addView(autoPill, weight(1, 34));
+        box.addView(control, margins(lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 16, 0, 0));
+
+        final TextView lvlText = Ui.text(this, "", 14, Ui.TEXT, Ui.MEDIUM);
+        box.addView(lvlText, margins(lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 16, 0, 0));
+        SeekBar lvl = new SeekBar(this);
+        lvl.setMax(95);   // 5..100 %
+        lvl.setProgress(prefs.getInt("flash_level", 100) - 5);
+        lvl.setSplitTrack(false);
+        lvl.setProgressTintList(ColorStateList.valueOf(Ui.YELLOW));
+        lvl.setProgressBackgroundTintList(ColorStateList.valueOf(0x40FFFFFF));
+        lvl.setThumbTintList(ColorStateList.valueOf(Ui.TEXT));
+        lvlText.setText("Độ sáng:  " + (lvl.getProgress() + 5) + "%");
+        lvl.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar sb, int p, boolean u) {
+                lvlText.setText("Độ sáng:  " + (p + 5) + "%");
+                if (!u) return;
+                prefs.edit().putInt("flash_level", p + 5).apply();
+                camLed = true;
+                flashBtn.setActive(true);
+                ui.removeCallbacks(flashSend);
+                ui.postDelayed(flashSend, 120);
+            }
+            @Override public void onStartTrackingTouch(SeekBar sb) { }
+            @Override public void onStopTrackingTouch(SeekBar sb) { }
+        });
+        box.addView(lvl, lp(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)));
+
+        final TextView fxTitle = Ui.text(this, "Hiệu ứng", 14, Ui.TEXT, Ui.MEDIUM);
+        box.addView(fxTitle, margins(lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 8, 0, 6));
+        final LinearLayout fxRow = segmented();
+        final String[] fxNames = { "Sáng", "Nháy", "Thở", "Chớp" };
+        final LinearLayout[] fxPills = new LinearLayout[fxNames.length];
+        for (int i = 0; i < fxNames.length; i++) {
+            fxPills[i] = pill(0, fxNames[i]);
+            fxRow.addView(fxPills[i], weight(1, 34));
+        }
+        box.addView(fxRow, lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        final TextView autoHelp = Ui.text(this, "Robot tự chọn: lái tay sáng khi chạy, nháy khi lùi hoặc gần vật cản, tắt sau 3 giây đứng yên · "
+                + "vào chế độ tự hành nháy báo xuất phát · tránh vật nháy pha khi thấy vật cản, chớp khi lùi, nháy khi đang tìm hướng · "
+                + "dò line nháy khi mất line · bám theo chớp khi bắt được mục tiêu, thở khi chờ · bấm còi thì chớp theo.", 12, Ui.MUTED, null);
+        box.addView(autoHelp, margins(lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 10, 0, 0));
+
+        box.addView(Ui.text(this, "Còi tự động khi tự hành", 14, Ui.TEXT, Ui.MEDIUM),
+                margins(lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 18, 0, 6));
+        final LinearLayout hornRow = segmented();
+        final LinearLayout hornOff = pill(0, "Tắt"), hornOn = pill(R.drawable.ic_horn, "Bật");
+        hornRow.addView(hornOff, weight(1, 34));
+        hornRow.addView(hornOn, weight(1, 34));
+        box.addView(hornRow, lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        box.addView(Ui.text(this, "Như xe tự hành: \"tin tin\" trước khi lăn bánh, bíp báo lùi, \"tin tin\" khi phanh gấp lùi tránh vật, "
+                + "tiếng dài khi bắt đầu thoát kẹt, 3 tiếng khi kẹt hẳn cần giúp, tiếng dài khi mất line, \"tin\" khi bắt được mục tiêu hoặc gặp vạch dừng. "
+                + "Đèn ở chế độ Tự động còn nháy pha khi có vật cản phía trước.", 12, Ui.MUTED, null),
+                margins(lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 8, 0, 0));
+        final Runnable hornRefresh = () -> {
+            boolean on = prefs.getBoolean("horn_auto", false);
+            setPill(hornOff, !on, Ui.ORANGE);
+            setPill(hornOn, on, Ui.ORANGE);
+        };
+        hornOff.setOnClickListener(v -> { prefs.edit().putBoolean("horn_auto", false).apply(); hornRefresh.run(); sendHornAuto(); });
+        hornOn.setOnClickListener(v -> {
+            if (!link.ready()) toast("Còi tự động cần kết nối Bluetooth với robot");
+            prefs.edit().putBoolean("horn_auto", true).apply();
+            hornRefresh.run();
+            sendHornAuto();
+        });
+        hornRefresh.run();
+
+        final Runnable refresh = () -> {
+            boolean auto = prefs.getBoolean("flash_auto", false);
+            setPill(manualPill, !auto, Ui.YELLOW);
+            setPill(autoPill, auto, Ui.YELLOW);
+            int fx = prefs.getInt("flash_fx", 0);
+            for (int i = 0; i < fxPills.length; i++) setPill(fxPills[i], !auto && i == fx, Ui.YELLOW);
+            fxTitle.setVisibility(auto ? View.GONE : View.VISIBLE);
+            fxRow.setVisibility(auto ? View.GONE : View.VISIBLE);
+            autoHelp.setVisibility(auto ? View.VISIBLE : View.GONE);
+        };
+        manualPill.setOnClickListener(v -> { prefs.edit().putBoolean("flash_auto", false).apply(); refresh.run(); setFlash(true); });
+        autoPill.setOnClickListener(v -> {
+            if (!link.ready()) toast("Chế độ tự động cần kết nối Bluetooth với robot");
+            prefs.edit().putBoolean("flash_auto", true).apply();
+            refresh.run();
+            setFlash(true);
+        });
+        for (int i = 0; i < fxPills.length; i++) {
+            final int fx = i;
+            fxPills[i].setOnClickListener(v -> { prefs.edit().putInt("flash_fx", fx).apply(); refresh.run(); setFlash(true); });
+        }
+        refresh.run();
+
+        dialog("Đèn flash & còi tự động")
+                .setView(box)
+                .setPositiveButton(camLed ? "Xong" : "Bật đèn", (d, w) -> setFlash(true))
+                .setNeutralButton("Tắt đèn", (d, w) -> setFlash(false))
+                .show();
     }
 
     private void sendHeadlight() {
@@ -525,12 +770,18 @@ public class MainActivity extends Activity implements BleLink.Listener {
         if (!link.ready()) return;
         long now = SystemClock.uptimeMillis();
         String cmd = null;
-        if (tankMode && (tankL.isActive() || tankR.isActive()))
+        if (style == STYLE_TANK && (tankL.isActive() || tankR.isActive()))
             cmd = "#M" + tankL.stickY() + "," + tankR.stickY();
-        else if (!tankMode && joy.isActive())
+        else if (style == STYLE_JOY && joy.isActive())
             cmd = "#D" + joy.stickY() + "," + (-joy.stickX());   // stick right = steer right (negative)
+        else if (style == STYLE_TILT && tilt.isActive())
+            cmd = "#D" + tilt.throttle() + "," + tilt.steer();
         else if (spin != 0)
             cmd = "#M" + (-spin * SPIN) + "," + (spin * SPIN);
+        else if (now < voiceUntil)
+            cmd = "#D" + voiceT + "," + voiceS;
+        else if (vision.mode() != Vision.OFF)
+            cmd = trackCommand(now);
         if (cmd != null) {
             link.send(cmd);
             stopBurst = 3;
@@ -557,6 +808,9 @@ public class MainActivity extends Activity implements BleLink.Listener {
             sendConfig();
             sendHeadlight();
             sendPan();
+            if (camLed) sendFlash();
+            sendHornAuto();
+            sendLights();
         } else {
             camera.clearHud();
             telemetry.clear();
@@ -572,6 +826,11 @@ public class MainActivity extends Activity implements BleLink.Listener {
             return;
         }
         if (line.equals("#E")) { radar.finishScan(); return; }
+        if (line.startsWith("#W")) {   // patrol alarm: offset,cm
+            String[] q = line.substring(2).split(",");
+            try { onAlarm(Integer.parseInt(q[0].trim()), Integer.parseInt(q[1].trim())); } catch (Exception ignored) { }
+            return;
+        }
         if (!line.startsWith("#T")) return;
         String[] p = line.substring(2).split(",");
         if (p.length < 7) return;
@@ -579,12 +838,374 @@ public class MainActivity extends Activity implements BleLink.Listener {
         try { for (int i = 0; i < 7; i++) v[i] = Integer.parseInt(p[i].trim()); }
         catch (NumberFormatException e) { return; }
         int mode = v[0];
-        if (mode < 0 || mode > 3) return;
+        if (mode < 0 || mode >= MODES) return;
         robotMode = mode;
         showMode(mode);
-        camera.setHud(MODE_HUD[mode], MODE_COLORS[mode], v[1], v[2]);
+        camera.setHud(MODE_HUD[mode], MODE_COLORS[mode], v[1], v[2], mode);
         telemetry.set(v[3], v[4], v[5], v[6]);
     }
+
+    // ------------------------------------------------------------------ voice commands
+
+    private void toggleListening() {
+        if (listening) { if (speech != null) speech.stopListening(); return; }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, PERM_VOICE);
+            return;
+        }
+        startListening();
+    }
+
+    private void startListening() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            toast("Máy chưa có dịch vụ nhận giọng nói (cần ứng dụng Google)");
+            return;
+        }
+        if (speech == null) {
+            speech = SpeechRecognizer.createSpeechRecognizer(this);
+            speech.setRecognitionListener(voiceListener);
+        }
+        Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "vi-VN");
+        i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5);
+        speech.startListening(i);
+        setListening(true);
+        subtitle.setText("Đang nghe... hãy nói lệnh");
+    }
+
+    private void setListening(boolean on) {
+        listening = on;
+        if (voiceTile != null) voiceTile.setActive(on);
+    }
+
+    private final RecognitionListener voiceListener = new RecognitionListener() {
+        @Override public void onReadyForSpeech(Bundle b) { }
+        @Override public void onBeginningOfSpeech() { }
+        @Override public void onRmsChanged(float db) { }
+        @Override public void onBufferReceived(byte[] buf) { }
+        @Override public void onEndOfSpeech() { }
+        @Override public void onPartialResults(Bundle b) { }
+        @Override public void onEvent(int type, Bundle b) { }
+
+        @Override public void onError(int error) {
+            setListening(false);
+            boolean unclear = error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT;
+            subtitle.setText(unclear ? "Không nghe rõ · bấm micro để nói lại" : "Lỗi nhận giọng nói (mã " + error + ")");
+        }
+
+        @Override public void onResults(Bundle b) {
+            setListening(false);
+            onVoice(b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION));
+        }
+    };
+
+    private void onVoice(List<String> heard) {
+        if (heard == null || heard.isEmpty()) { subtitle.setText("Không nghe rõ · bấm micro để nói lại"); return; }
+        for (String h : heard) {
+            int[] c = VoiceCommands.parse(h);
+            if (c == null) continue;
+            subtitle.setText("Đã nghe: \"" + h + "\"");
+            runVoice(c);
+            return;
+        }
+        subtitle.setText("Chưa hiểu \"" + heard.get(0) + "\" · giữ nút Giọng nói để xem các lệnh");
+    }
+
+    private void runVoice(int[] c) {
+        switch (c[0]) {
+            case VoiceCommands.STOP:
+                voiceUntil = 0;
+                spin = 0;
+                stopDance();
+                stopTracking();
+                panBar.setProgress(80);
+                if (link.ready()) link.send("#R");
+                break;
+            case VoiceCommands.FORWARD:    voiceDrive(60, 0, 1500); break;
+            case VoiceCommands.BACK:       voiceDrive(-50, 0, 1200); break;
+            case VoiceCommands.LEFT:       voiceDrive(55, 100, 1300); break;
+            case VoiceCommands.RIGHT:      voiceDrive(55, -100, 1300); break;
+            case VoiceCommands.SPIN_LEFT:  voiceDrive(0, 100, 800); break;   // no throttle + full steer = spin on the spot
+            case VoiceCommands.SPIN_RIGHT: voiceDrive(0, -100, 800); break;
+            case VoiceCommands.U_TURN:     voiceDrive(0, 100, 1700); break;
+            case VoiceCommands.HORN:
+                horn(true);
+                ui.postDelayed(() -> horn(false), 450);
+                break;
+            case VoiceCommands.LIGHT_ON:    setFlash(true); break;
+            case VoiceCommands.LIGHT_OFF:   setFlash(false); break;
+            case VoiceCommands.MODE:        setRobotMode(c[1]); break;
+            case VoiceCommands.DANCE:       if (!beats.isRunning()) toggleDance(); break;
+            case VoiceCommands.RADAR:       startRadar(); break;
+            case VoiceCommands.TRACK_COLOR: if (vision.mode() != Vision.COLOR) toggleTracking(Vision.COLOR); break;
+            case VoiceCommands.TRACK_FACE:  if (vision.mode() != Vision.FACE) toggleTracking(Vision.FACE); break;
+            case VoiceCommands.SPEED:       selectSpeed(c[1]); break;
+        }
+    }
+
+    private void voiceDrive(int t, int s, long ms) {
+        if (!link.ready()) { toast("Chưa kết nối robot"); return; }
+        stopDance();
+        stopTracking();
+        voiceT = t;
+        voiceS = s;
+        voiceUntil = SystemClock.uptimeMillis() + ms;
+    }
+
+    private void showVoiceHelp() {
+        dialog("Lệnh giọng nói")
+                .setMessage("Bấm nút Giọng nói rồi nói một lệnh (tiếng Việt):\n\n"
+                        + "• tiến / lùi / rẽ trái / rẽ phải\n"
+                        + "• xoay trái / xoay phải / quay đầu\n"
+                        + "• dừng lại\n"
+                        + "• bóp còi · bật đèn · tắt đèn\n"
+                        + "• nhanh / vừa / chậm\n"
+                        + "• tránh vật · dò line · bám theo · canh gác · lái tay\n"
+                        + "• nhảy · quét radar · bám màu · bám mặt\n\n"
+                        + "Cần dịch vụ nhận giọng nói của Google trên máy.")
+                .setPositiveButton("Đóng", null)
+                .show();
+    }
+
+    // ------------------------------------------------------------------ dance
+
+    private void toggleDance() {
+        if (beats.isRunning()) { stopDance(); return; }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, PERM_DANCE);
+            return;
+        }
+        startDance();
+    }
+
+    private void startDance() {
+        if (!link.ready()) { toast("Chưa kết nối robot"); return; }
+        stopTracking();
+        voiceUntil = 0;
+        if (!beats.start()) { toast("Không mở được micro"); return; }
+        link.send("#A0");
+        showMode(0);
+        danceStep = 0;
+        danceTile.setActive(true);
+        subtitle.setText("Đang nghe nhạc · mở nhạc to gần điện thoại");
+    }
+
+    private void stopDance() {
+        if (!beats.isRunning()) return;
+        beats.stop();
+        danceTile.setActive(false);
+    }
+
+    private void onBeat(float strength) {
+        if (!link.ready()) return;
+        link.send("#X" + DANCE_STEPS[danceStep++ % DANCE_STEPS.length]);
+        danceTile.setActive(false);   // flicker the tile on every beat
+        ui.postDelayed(() -> danceTile.setActive(beats.isRunning()), 90);
+    }
+
+    // ------------------------------------------------------------------ colour / face tracking
+
+    private void toggleTracking(int m) {
+        if (vision.mode() == m) { stopTracking(); return; }
+        if (!link.ready()) { toast("Chưa kết nối robot"); return; }
+        stopDance();
+        voiceUntil = 0;
+        if (!camera.isRunning()) startCamera();
+        target = null;
+        targetSeen = 0;
+        trackPan = 175 - panBar.getProgress();
+        link.send("#A0");
+        showMode(0);
+        pickColor = false;
+        if (m == Vision.COLOR) {
+            int rgb = prefs.getInt("track_rgb", 0);
+            pickColor = rgb == 0 || !vision.setColor(rgb);
+            toast(pickColor ? "Chạm vào vật trên hình camera để chọn màu cần bám"
+                            : "Bám màu đã chọn lần trước · chạm vào hình để chọn màu khác");
+        } else {
+            toast("Đang tìm khuôn mặt · đứng trước camera");
+        }
+        vision.setMode(m);
+        colorTile.setActive(m == Vision.COLOR);
+        faceTile.setActive(m == Vision.FACE);
+    }
+
+    private void stopTracking() {
+        if (vision == null || vision.mode() == Vision.OFF) return;
+        vision.setMode(Vision.OFF);
+        colorTile.setActive(false);
+        faceTile.setActive(false);
+        camera.setTrack(null, 0, null);
+        target = null;
+        stopBurst = 3;
+        if (link.ready()) link.send("#S");
+    }
+
+    private void pickColorAt(float x, float y) {
+        int c = camera.colorAt(x, y);
+        if (c == 0) { toast("Chưa có hình camera"); return; }
+        if (!vision.setColor(c)) { toast("Màu này nhạt quá · chọn vật có màu rực hơn"); return; }
+        prefs.edit().putInt("track_rgb", c).apply();
+        pickColor = false;
+        target = null;
+        toast("Đã chọn màu · robot bắt đầu bám theo");
+    }
+
+    private void onVision(Vision.Result r) {
+        long now = SystemClock.uptimeMillis();
+        if (r.mode == Vision.COLOR && pickColor) return;
+        if (!r.found) {
+            if (now - targetSeen > 700) camera.setTrack(null, 0, null);
+            return;
+        }
+        boolean fresh = now - targetSeen > 3000;
+        target = r;
+        targetSeen = now;
+        // the camera rides on the pan servo: turn it toward the target (bigger angle = left)
+        trackPan = Math.max(25, Math.min(165, trackPan - Math.round((r.cx - 0.5f) * 34)));
+        panBar.setProgress(175 - trackPan);
+        boolean face = r.mode == Vision.FACE;
+        camera.setTrack(r.box, face ? Ui.CYAN : Ui.ORANGE, face ? "Khuôn mặt" : "Mục tiêu");
+        if (face && fresh && link.ready()) {   // say hello: hazard lights and "beep beep"
+            link.send("#Y4");
+            horn(true);
+            ui.postDelayed(() -> horn(false), 150);
+            ui.postDelayed(() -> horn(true), 300);
+            ui.postDelayed(() -> horn(false), 450);
+        }
+    }
+
+    /** Body follows where the camera looks; distance from the target's apparent size. */
+    private String trackCommand(long now) {
+        if (target == null || now - targetSeen > 700) return null;   // lost: stop, keep looking that way
+        if (now - lastPanCmd > 90) { link.send("#P" + trackPan); lastPanCmd = now; }
+        int po = trackPan - 95;                                   // + = target is to the left
+        float goal = target.mode == Vision.FACE ? 0.07f : 0.05f;
+        float e = (goal - target.size) / goal;                    // + = too far away
+        int t = Math.abs(e) < 0.25f ? 0 : Math.max(-45, Math.min(60, Math.round(e * 70)));
+        t = t * Math.max(0, 50 - Math.abs(po)) / 50;             // turn toward it first, then drive
+        int s = Math.abs(po) < 8 ? 0 : Math.max(-100, Math.min(100, Math.round(po * 2.5f)));
+        if (t == 0 && Math.abs(s) <= 35) return null;
+        return "#D" + t + "," + s;
+    }
+
+    // ------------------------------------------------------------------ patrol alarm
+
+    private static String direction(int off) {
+        return Math.abs(off) < 15 ? "phía trước" : (off > 0 ? "bên trái " : "bên phải ") + Math.abs(off) + "°";
+    }
+
+    private void onAlarm(int off, int cm) {
+        String msg = "Có chuyển động " + direction(off) + ", cách " + cm + " cm";
+        subtitle.setText("BÁO ĐỘNG · " + msg);
+        toast("Báo động: " + msg);
+        Vibrator vib = getSystemService(Vibrator.class);
+        if (vib != null) vib.vibrate(VibrationEffect.createWaveform(new long[] { 0, 400, 200, 400, 200, 700 }, -1));
+        if (!camera.isRunning()) startCamera();   // the camera is already turned toward it
+
+        Intent open = new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        Notification.Builder nb = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, ALARM_CHANNEL)
+                                                              : new Notification.Builder(this);
+        nb.setSmallIcon(R.drawable.ic_shield)
+          .setContentTitle("Zin Robot · báo động")
+          .setContentText(msg)
+          .setAutoCancel(true)
+          .setContentIntent(android.app.PendingIntent.getActivity(this, 0, open, android.app.PendingIntent.FLAG_IMMUTABLE));
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        if (nm != null) nm.notify(1, nb.build());
+
+        String all = prefs.getString("alarms", "");
+        String[] old = all.isEmpty() ? new String[0] : all.split("\n");
+        StringBuilder sb = new StringBuilder(System.currentTimeMillis() + ";" + off + ";" + cm);
+        for (int i = 0; i < old.length && i < 29; i++) sb.append('\n').append(old[i]);   // newest first, keep 30
+        prefs.edit().putString("alarms", sb.toString()).apply();
+    }
+
+    private void showAlarmHistory() {
+        String all = prefs.getString("alarms", "");
+        if (all.isEmpty()) { toast("Chưa có lần báo động nào"); return; }
+        String[] e = all.split("\n");
+        String[] items = new String[e.length];
+        java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("dd/MM HH:mm:ss", java.util.Locale.getDefault());
+        for (int i = 0; i < e.length; i++) {
+            String[] q = e[i].split(";");
+            items[i] = fmt.format(new java.util.Date(Long.parseLong(q[0]))) + " · " + direction(Integer.parseInt(q[1])) + " · " + q[2] + " cm";
+        }
+        dialog("Lịch sử báo động")
+                .setItems(items, null)
+                .setNeutralButton("Xóa tất cả", (d, w) -> { prefs.edit().remove("alarms").apply(); toast("Đã xóa"); })
+                .setNegativeButton("Đóng", null)
+                .show();
+    }
+
+    // ------------------------------------------------------------------ car lights on the RGB matrix
+
+    private void sendLights() {
+        if (!link.ready()) return;
+        link.send("#J" + (prefs.getBoolean("sig_lights", true) ? 1 : 0));
+        link.send("#L" + prefs.getInt("led_layout", 0) + "," + prefs.getInt("led_flags", 0));
+    }
+
+    private LinearLayout pillRow(LinearLayout box, String title, String... names) {
+        if (title != null)
+            box.addView(Ui.text(this, title, 14, Ui.TEXT, Ui.MEDIUM),
+                    margins(lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 16, 0, 6));
+        LinearLayout row = segmented();
+        for (String n : names) row.addView(pill(0, n), weight(1, 34));
+        box.addView(row, margins(lp(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, title == null ? 6 : 0, 0, 0));
+        return row;
+    }
+
+    private void showLightsSettings() {
+        LinearLayout box = vbox();
+        box.setPadding(dp(24), dp(8), dp(24), dp(4));
+        box.addView(Ui.text(this, "Ma trận LED làm đèn xe: xi-nhan khi rẽ, đèn khẩn cấp khi gặp sự cố, "
+                + "đèn phanh khi giảm tốc, đèn lùi khi lùi, đèn cảnh sát khi báo động.", 13, Ui.MUTED, null));
+        final LinearLayout onRow = pillRow(box, "Đèn tín hiệu", "Tắt", "Bật");
+        final LinearLayout layRow = pillRow(box, "Bố cục ma trận LED", "8 cột × 5 hàng", "5 cột × 8 hàng", "Dải");
+        final LinearLayout flagRow = pillRow(box, null, "Đảo trái/phải", "Lật trên/dưới", "Zigzag");
+        final LinearLayout testRow = pillRow(box, "Thử đèn (3 giây)", "Trái", "Phải", "Phanh", "Khẩn cấp");
+        box.addView(Ui.text(this, "Nếu bấm \"Trái\" mà bên phải nháy thì bật Đảo trái/phải. Nếu đèn phanh không nằm ở hàng dưới "
+                + "thì đổi bố cục hoặc Lật trên/dưới. Đèn bị xé hình thì thử Zigzag.", 12, Ui.MUTED, null),
+                margins(lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 12, 0, 0));
+
+        final Runnable refresh = () -> {
+            boolean on = prefs.getBoolean("sig_lights", true);
+            setPill((LinearLayout) onRow.getChildAt(0), !on, Ui.ACCENT);
+            setPill((LinearLayout) onRow.getChildAt(1), on, Ui.ACCENT);
+            int lay = prefs.getInt("led_layout", 0), fl = prefs.getInt("led_flags", 0);
+            for (int i = 0; i < 3; i++) setPill((LinearLayout) layRow.getChildAt(i), i == lay, Ui.ACCENT);
+            for (int i = 0; i < 3; i++) setPill((LinearLayout) flagRow.getChildAt(i), (fl & (1 << i)) != 0, Ui.ORANGE);
+            for (int i = 0; i < 4; i++) setPill((LinearLayout) testRow.getChildAt(i), false, Ui.ACCENT);
+        };
+        for (int i = 0; i < 2; i++) {
+            final boolean on = i == 1;
+            onRow.getChildAt(i).setOnClickListener(v -> { prefs.edit().putBoolean("sig_lights", on).apply(); refresh.run(); sendLights(); });
+        }
+        for (int i = 0; i < 3; i++) {
+            final int lay = i, bit = 1 << i;
+            layRow.getChildAt(i).setOnClickListener(v -> { prefs.edit().putInt("led_layout", lay).apply(); refresh.run(); sendLights(); });
+            flagRow.getChildAt(i).setOnClickListener(v -> {
+                prefs.edit().putInt("led_flags", prefs.getInt("led_flags", 0) ^ bit).apply();
+                refresh.run();
+                sendLights();
+            });
+        }
+        for (int i = 0; i < 4; i++) {
+            final int test = i + 1;
+            testRow.getChildAt(i).setOnClickListener(v -> {
+                if (!link.ready()) { toast("Chưa kết nối robot"); return; }
+                link.send("#Y" + test);
+            });
+        }
+        refresh.run();
+        dialog("Đèn xe trên ma trận LED")
+                .setView(box)
+                .setPositiveButton("Xong", null)
+                .show();
+    }
+
 
     // ------------------------------------------------------------------ radar
 
@@ -687,6 +1308,10 @@ public class MainActivity extends Activity implements BleLink.Listener {
             prefs.edit().putInt("steer_trim", v).apply();   // live preview on the robot
             sendConfig();
         });
+        TextView ledLink = Ui.text(this, "Đèn xi-nhan, phanh & bố cục LED  ›", 14, Ui.CYAN, Ui.MEDIUM);
+        ledLink.setPadding(0, dp(10), 0, dp(10));
+        ledLink.setOnClickListener(v -> showLightsSettings());
+        box.addView(ledLink, margins(lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 10, 0, 0));
         box.addView(Ui.text(this, "Địa chỉ camera", 14, Ui.TEXT, Ui.MEDIUM),
                 margins(lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 18, 0, 0));
         final EditText cam = new EditText(this);

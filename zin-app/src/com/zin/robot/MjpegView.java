@@ -29,6 +29,9 @@ import java.net.URL;
  * driving HUD drawn on top: mode, distance, line sensors, collision guard, frame rate.
  */
 public class MjpegView extends View {
+    /** Every decoded frame, on the camera thread (for image analysis). */
+    interface FrameListener { void onFrame(Bitmap bm); }
+
     private static final int MAX_FRAME = 2 * 1024 * 1024;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -52,7 +55,16 @@ public class MjpegView extends View {
     private int modeColor = Ui.ACCENT;
     private int distCm = -1;
     private int lineBits;
-    private boolean guard, lineLost, thinking;
+    private boolean guard, lineLost, thinking, stuck, alarm;
+    private int modeIndex = -1;
+
+    // tracking overlay, normalised to the frame
+    private final RectF track = new RectF();
+    private boolean trackOn;
+    private int trackColor;
+    private String trackLabel;
+    private final Paint trackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private volatile FrameListener frameListener;
 
     private final Paint scrim = new Paint();
     private final Drawable rulerIcon, wifiIcon;
@@ -69,8 +81,40 @@ public class MjpegView extends View {
 
     public boolean isRunning() { return running; }
 
-    public void setHud(String mode, int color, int dist, int flags) {
+    void setFrameListener(FrameListener l) { frameListener = l; }
+
+    /** Box around the tracked target (normalised 0..1), or null to hide it. */
+    void setTrack(RectF box, int color, String label) {
+        trackOn = box != null;
+        if (box != null) track.set(box);
+        trackColor = color;
+        trackLabel = label;
+        invalidate();
+    }
+
+    /** Average colour around a touch point (view coordinates), or 0 when no picture is shown there. */
+    int colorAt(float x, float y) {
+        Bitmap bm = frame;
+        if (bm == null || !dst.contains((int) x, (int) y)) return 0;
+        int fx = (int) ((x - dst.left) / dst.width() * bm.getWidth());
+        int fy = (int) ((y - dst.top) / dst.height() * bm.getHeight());
+        int r = 0, g = 0, b = 0, n = 0;
+        for (int dy = -3; dy <= 3; dy++) {
+            for (int dx = -3; dx <= 3; dx++) {
+                int px = fx + dx, py = fy + dy;
+                if (px < 0 || py < 0 || px >= bm.getWidth() || py >= bm.getHeight()) continue;
+                int c = bm.getPixel(px, py);
+                r += (c >> 16) & 0xFF; g += (c >> 8) & 0xFF; b += c & 0xFF;
+                n++;
+            }
+        }
+        return n == 0 ? 0 : 0xFF000000 | (r / n << 16) | (g / n << 8) | (b / n);
+    }
+
+    public void setHud(String mode, int color, int dist, int flags, int index) {
         hudValid = true;
+        modeIndex = index;
+        alarm = (flags & 0x100) != 0;
         modeName = mode;
         modeColor = color;
         distCm = dist;
@@ -78,6 +122,7 @@ public class MjpegView extends View {
         guard = (flags & 0x08) != 0;
         lineLost = (flags & 0x10) != 0;
         thinking = (flags & 0x20) != 0;
+        stuck = (flags & 0x80) != 0;
         invalidate();
     }
 
@@ -163,6 +208,8 @@ public class MjpegView extends View {
                     }
                     final Bitmap bm = BitmapFactory.decodeByteArray(buf, 0, len);
                     if (bm == null) continue;
+                    FrameListener fl = frameListener;
+                    if (fl != null) fl.onFrame(bm);
                     frames++;
                     long dt = System.currentTimeMillis() - t0;
                     if (dt >= 2000) { fps = (int) (frames * 1000 / dt); frames = 0; t0 = System.currentTimeMillis(); }
@@ -193,15 +240,15 @@ public class MjpegView extends View {
         return sb.toString();
     }
 
-    /** Flash LED of the ESP32-CAM (firmware endpoint /led?on=0|1). */
-    public void setLed(final String address, final boolean on) {
+    /** Flash LED of the ESP32-CAM over Wi-Fi (firmware endpoint /led?level=0..100&fx=0..3). */
+    public void setFlash(final String address, final int level, final int fx) {
         final String url = normalize(address);
         if (url == null) return;
         new Thread(new Runnable() {
             @Override public void run() {
                 HttpURLConnection c = null;
                 try {
-                    c = open(base(url) + "led?on=" + (on ? 1 : 0));
+                    c = open(base(url) + "led?level=" + level + "&fx=" + fx);
                     c.setConnectTimeout(3000);
                     c.setReadTimeout(3000);
                     c.getResponseCode();
@@ -231,6 +278,7 @@ public class MjpegView extends View {
             int dw = (int) (bm.getWidth() * s), dh = (int) (bm.getHeight() * s);
             dst.set((w - dw) / 2, (h - dh) / 2, (w + dw) / 2, (h + dh) / 2);
             c.drawBitmap(bm, null, dst, paint);
+            if (trackOn) drawTrack(c);
         }
         // bottom scrim keeps the overlay readable on bright scenes
         scrim.setShader(new LinearGradient(0, h * 0.62f, 0, h, 0x00050A18, 0xCC050A18, Shader.TileMode.CLAMP));
@@ -254,6 +302,24 @@ public class MjpegView extends View {
         }
         if (hudValid) drawHud(c, w, h);
         c.restore();
+    }
+
+    private void drawTrack(Canvas c) {
+        float l = dst.left + track.left * dst.width(), t = dst.top + track.top * dst.height();
+        float r = dst.left + track.right * dst.width(), b = dst.top + track.bottom * dst.height();
+        float rad = Ui.dp(getContext(), 10);
+        trackPaint.setStyle(Paint.Style.STROKE);
+        trackPaint.setStrokeWidth(Ui.dp(getContext(), 3));
+        trackPaint.setColor(trackColor);
+        rf.set(l, t, r, b);
+        c.drawRoundRect(rf, rad, rad, trackPaint);
+        trackPaint.setStyle(Paint.Style.FILL);
+        c.drawCircle((l + r) / 2, (t + b) / 2, Ui.dp(getContext(), 4), trackPaint);
+        if (trackLabel != null) {
+            text.setTextAlign(Paint.Align.LEFT);
+            text.setColor(trackColor);
+            c.drawText(trackLabel, l, t - Ui.dp(getContext(), 6), text);
+        }
     }
 
     private float chip(Canvas c, float x, float y, String s, int bg, Drawable ic, boolean alignRight) {
@@ -288,7 +354,10 @@ public class MjpegView extends View {
         chip(c, w - m, m, none ? "-- cm" : distCm + " cm", dc, rulerIcon, true);
 
         float row2 = m + Ui.dp(getContext(), 36);
-        if (guard) chip(c, m, row2, "Đang tránh va chạm", Ui.withAlpha(Ui.RED, 215), null, false);
+        if (alarm) chip(c, m, row2, "BÁO ĐỘNG · có chuyển động", Ui.withAlpha(Ui.RED, 235), null, false);
+        else if (modeIndex == 4) chip(c, m, row2, thinking ? "Đang ghi nhớ căn phòng" : "Đang canh gác", Ui.withAlpha(Ui.VIOLET, 215), null, false);
+        else if (stuck) chip(c, m, row2, thinking ? "Đang thoát kẹt" : "Bị kẹt · cần giúp", Ui.withAlpha(Ui.RED, 215), null, false);
+        else if (guard) chip(c, m, row2, "Đang tránh va chạm", Ui.withAlpha(Ui.RED, 215), null, false);
         else if (lineLost) chip(c, m, row2, "Mất vạch", Ui.withAlpha(Ui.ORANGE, 215), null, false);
         else if (thinking) chip(c, m, row2, "Đang tìm đường", Ui.withAlpha(0xFF14B8D4, 215), null, false);
 

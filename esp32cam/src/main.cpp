@@ -1,7 +1,10 @@
 // ESP32-CAM (AI-Thinker pinout, as in the vendor sketch) for the ZYC0109 robot.
 // Runs its own Wi-Fi access point, so no home network or IP lookup is needed:
 //   join Wi-Fi AP_SSID, then the stream is at http://192.168.4.1/  (same URL format as the vendor sketch)
-//   http://192.168.4.1/led?on=1 / ?on=0 switches the flash LED.
+//   http://192.168.4.1/led?level=0..100&fx=0..3 sets the flash LED (?on=1 / ?on=0 still works).
+// The flash can also be driven over Bluetooth without Wi-Fi: the STM32 repeats the app's
+// "#F level,fx" frame on its TX line, which reaches our RX (GPIO3) at 9600 baud.
+//   fx: 0 steady, 1 blink, 2 breathe, 3 strobe
 // After boot the UART TX pin is released, so even with the S4 switch on it cannot block the
 // STM32 <-> BT05 Bluetooth link.
 #include <Arduino.h>
@@ -33,6 +36,11 @@
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 #define FLASH_LED_PIN 4
+#define FLASH_LEDC_CH 2     // channel 0 / timer 0 drive the camera clock; channel 2 runs on timer 1
+#define FLASH_BITS 10
+
+enum { FX_STEADY, FX_BLINK, FX_BREATHE, FX_STROBE, FX_COUNT };
+static volatile int flash_level, flash_fx;   // set by HTTP / UART, rendered in loop()
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char *STREAM_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
@@ -70,15 +78,65 @@ static esp_err_t stream_handler(httpd_req_t *req)
     return res;
 }
 
+static void flash_set(int level, int fx)
+{
+    flash_level = constrain(level, 0, 100);
+    flash_fx = fx >= 0 && fx < FX_COUNT ? fx : FX_STEADY;
+}
+
 static esp_err_t led_handler(httpd_req_t *req)
 {
-    char query[32], val[4] = "0";
-    if (httpd_req_get_url_query_str(req, query, sizeof query) == ESP_OK)
-        httpd_query_key_value(query, "on", val, sizeof val);
-    bool on = val[0] == '1';
-    digitalWrite(FLASH_LED_PIN, on ? HIGH : LOW);
+    char query[48], val[8];
+    int level = flash_level, fx = flash_fx;
+    if (httpd_req_get_url_query_str(req, query, sizeof query) == ESP_OK) {
+        if (httpd_query_key_value(query, "on", val, sizeof val) == ESP_OK) level = val[0] == '1' ? 100 : 0;
+        if (httpd_query_key_value(query, "level", val, sizeof val) == ESP_OK) level = atoi(val);
+        if (httpd_query_key_value(query, "fx", val, sizeof val) == ESP_OK) fx = atoi(val);
+    }
+    flash_set(level, fx);
+    char reply[32];
+    snprintf(reply, sizeof reply, "led %d,%d", flash_level, flash_fx);
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_sendstr(req, on ? "led on" : "led off");
+    return httpd_resp_sendstr(req, reply);
+}
+
+/** "#F level,fx" frames from the STM32; telemetry and anything else on the line is skipped. */
+static void uart_poll()
+{
+    static char line[24];
+    static int len = -1;   // -1 = outside a frame
+    while (Serial.available()) {
+        char b = (char)Serial.read();
+        if (b == '#') { len = 0; continue; }
+        if (len < 0) continue;
+        if (b == '\n' || b == '\r') {
+            line[len] = 0;
+            int level, fx = 0;
+            if (line[0] == 'F' && sscanf(line + 1, "%d,%d", &level, &fx) >= 1) flash_set(level, fx);
+            len = -1;
+        } else if (len < (int)sizeof line - 1) {
+            line[len++] = b;
+        } else {
+            len = -1;
+        }
+    }
+}
+
+/** Brightness 0..100 % for the current effect, perceptually scaled to the PWM duty. */
+static void flash_render()
+{
+    uint32_t t = millis();
+    int level = flash_level;
+    switch (flash_fx) {
+    case FX_BLINK:   if (t % 1000 >= 500) level = 0; break;
+    case FX_BREATHE: {
+        int ph = t % 2000;
+        level = level * (ph < 1000 ? ph : 2000 - ph) / 1000;
+        break;
+    }
+    case FX_STROBE:  if (t % 120 >= 30) level = 0; break;
+    }
+    ledcWrite(FLASH_LEDC_CH, (uint32_t)level * level * ((1 << FLASH_BITS) - 1) / 10000);
 }
 
 static void start_server()
@@ -131,8 +189,9 @@ static bool start_camera()
 void setup()
 {
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);   // motors starting can dip the supply
-    pinMode(FLASH_LED_PIN, OUTPUT);
-    digitalWrite(FLASH_LED_PIN, LOW);
+    ledcSetup(FLASH_LEDC_CH, 5000, FLASH_BITS);
+    ledcAttachPin(FLASH_LED_PIN, FLASH_LEDC_CH);
+    ledcWrite(FLASH_LEDC_CH, 0);
 
     Serial.begin(115200);
     bool cam_ok = start_camera();
@@ -145,12 +204,16 @@ void setup()
     Serial.printf("\ncamera %s, Wi-Fi \"%s\", stream http://%s/\n",
                   cam_ok ? "ok" : "FAILED", AP_SSID, WiFi.softAPIP().toString().c_str());
     Serial.flush();
-    // Release UART0 TX: it shares the STM32 RX line with the BT05 when switch S4 is on.
+    // From here on only listen, at the STM32's 9600 baud, for flash commands.
     Serial.end();
+    Serial.begin(9600);
+    // Release UART0 TX: it shares the STM32 RX line with the BT05 when switch S4 is on.
     pinMode(1, INPUT);
 }
 
 void loop()
 {
-    delay(1000);
+    uart_poll();
+    flash_render();
+    delay(10);
 }
