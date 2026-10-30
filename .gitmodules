@@ -1,0 +1,3 @@
+[submodule "esp32cam/external/btstack"]
+	path = esp32cam/external/btstack
+	url = https://github.com/bluekitchen/btstack

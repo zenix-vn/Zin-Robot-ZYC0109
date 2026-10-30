@@ -7,3 +7,8 @@ zin-app/build/
 *.apk
 *.keystore
 *.idsig
+
+# ESP-IDF generated config and downloaded components (esp32cam)
+esp32cam/sdkconfig.esp32cam
+esp32cam/managed_components/
+esp32cam/dependencies.lock

@@ -33,7 +33,7 @@
             android:exported="true"
             android:screenOrientation="portrait"
             android:launchMode="singleTop"
-            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation"
             android:windowSoftInputMode="adjustPan">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

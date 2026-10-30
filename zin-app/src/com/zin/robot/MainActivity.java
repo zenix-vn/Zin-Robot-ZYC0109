@@ -25,6 +25,7 @@ import android.text.InputType;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -40,7 +41,7 @@ import android.widget.TextView;
 import java.util.ArrayList;
 import java.util.List;
 
-public class MainActivity extends Activity implements BleLink.Listener {
+public class MainActivity extends Activity implements BleLink.Listener, GamePad.Listener {
     private static final String[] MODE_NAMES = { "Lái tay", "Tránh vật", "Dò line", "Bám theo", "Canh gác" };
     private static final String[] MODE_HUD = { "Lái tay", "Tránh vật cản", "Dò line", "Bám theo", "Canh gác" };
     private static final int[] MODE_ICONS = { R.drawable.ic_wheel, R.drawable.ic_radar, R.drawable.ic_route, R.drawable.ic_target,
@@ -76,6 +77,7 @@ public class MainActivity extends Activity implements BleLink.Listener {
     private TiltPad tilt;
     private TelemetryView telemetry;
     private Tile voiceTile, danceTile, colorTile, faceTile;
+    private Tile padTile;
 
     private int style;
     private boolean camLed, headlight;
@@ -101,6 +103,12 @@ public class MainActivity extends Activity implements BleLink.Listener {
     private int stopBurst;
     private long lastSent, lastPanSent;
 
+    // PS5 / Bluetooth gamepad paired with the phone
+    private GamePad pad;
+    private boolean padDriving;
+    private int padSpin;           // L1 / R1 held: same as the spin buttons
+    private int lastFlags;         // telemetry flags, for rumble on new events
+
     // ------------------------------------------------------------------ lifecycle
 
     @Override protected void onCreate(Bundle b) {
@@ -112,6 +120,7 @@ public class MainActivity extends Activity implements BleLink.Listener {
         style = prefs.getInt("style", prefs.getBoolean("tank", false) ? STYLE_TANK : STYLE_JOY);
         headlight = prefs.getBoolean("headlight", true);
         link = new BleLink(this, this);
+        pad = new GamePad(this, this);
         beats = new BeatDetector(this::onBeat);
         vision = new Vision(this::onVision);
         setContentView(buildUi());
@@ -130,6 +139,7 @@ public class MainActivity extends Activity implements BleLink.Listener {
     @Override protected void onResume() {
         super.onResume();
         if (hasPerms()) link.start();
+        pad.start();
         if (prefs.getBoolean("cam_on", true) || vision.mode() != Vision.OFF) startCamera();
         tilt.listen(style == STYLE_TILT);
         ui.removeCallbacks(tick);
@@ -139,6 +149,9 @@ public class MainActivity extends Activity implements BleLink.Listener {
     @Override protected void onPause() {
         if (link.ready() && robotMode == 0) link.send("#S");   // only stop manual driving; auto modes keep running
         ui.removeCallbacks(tick);
+        pad.stop();
+        padDriving = false;
+        padSpin = 0;
         camera.stop();
         camBtn.setActive(false);
         tilt.listen(false);
@@ -281,6 +294,12 @@ public class MainActivity extends Activity implements BleLink.Listener {
         linkText = Ui.text(this, "Ngắt", 13, Ui.MUTED, Ui.MEDIUM);
         linkPill.addView(linkText, margins(lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT), 6, 0, 0, 0));
         linkPill.setOnClickListener(v -> showDevicePicker());
+        padTile = new Tile(this, R.drawable.ic_gamepad, null, true, 18);
+        padTile.setActiveColor(Ui.VIOLET);
+        padTile.setActive(true);
+        padTile.setVisibility(View.GONE);   // shown while a gamepad is connected
+        padTile.setOnClickListener(v -> showPadHelp());
+        header.addView(padTile, margins(lp(dp(36), dp(36)), 0, 0, 8, 0));
         header.addView(linkPill, lp(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)));
         Tile gear = new Tile(this, R.drawable.ic_settings, null, true, 18);
         gear.setOnClickListener(v -> showSettings());
@@ -541,15 +560,20 @@ public class MainActivity extends Activity implements BleLink.Listener {
         b.setClickable(true);
         b.setOnClickListener(v -> {
             v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-            spin = 0;
-            stopBurst = 0;
-            voiceUntil = 0;
-            stopDance();
-            stopTracking();
-            panBar.setProgress(80);
-            if (link.ready()) { link.send("#R"); link.send("#R"); }   // rest pose: stopped, wheels and camera straight
+            restPose();
         });
         return b;
+    }
+
+    private void restPose() {
+        spin = 0;
+        padSpin = 0;
+        stopBurst = 0;
+        voiceUntil = 0;
+        stopDance();
+        stopTracking();
+        panBar.setProgress(80);
+        if (link.ready()) { link.send("#R"); link.send("#R"); }   // rest pose: stopped, wheels and camera straight
     }
 
     // ------------------------------------------------------------------ UI state
@@ -753,10 +777,28 @@ public class MainActivity extends Activity implements BleLink.Listener {
     }
 
     private void sendConfig() {
+        ui.removeCallbacks(calibSync);
+        ui.postDelayed(calibSync, 800);
         if (!link.ready()) return;
         int s = SPEEDS[prefs.getInt("speed", 1)];
         link.send("#C" + s + "," + prefs.getInt("trim_l", 0) + "," + prefs.getInt("trim_r", 0) + "," + prefs.getInt("steer_trim", 0));
     }
+
+    /** The ESP32-CAM keeps a copy of the motor trims, so driving with a gamepad paired to the robot matches. */
+    private final Runnable calibSync = () -> {
+        String a = camAddress();
+        final String url = (a.startsWith("http") ? a : "http://" + a) + "/config?tl=" + prefs.getInt("trim_l", 0)
+                + "&tr=" + prefs.getInt("trim_r", 0) + "&st=" + prefs.getInt("steer_trim", 0);
+        new Thread(() -> {
+            try {
+                java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                c.setConnectTimeout(1500);
+                c.setReadTimeout(1500);
+                c.getResponseCode();
+                c.disconnect();
+            } catch (Exception ignored) { }   // not on the camera's Wi-Fi: synced next time
+        }).start();
+    };
 
     /** 10 Hz command stream: the robot stops by itself if this stream stops (failsafe). */
     private final Runnable tick = new Runnable() {
@@ -770,7 +812,16 @@ public class MainActivity extends Activity implements BleLink.Listener {
         if (!link.ready()) return;
         long now = SystemClock.uptimeMillis();
         String cmd = null;
-        if (style == STYLE_TANK && (tankL.isActive() || tankR.isActive()))
+        if (pad.active()) {
+            padDriving = true;
+            if (style == STYLE_TANK) cmd = "#M" + pad.leftY() + "," + pad.rightY();
+            else {
+                cmd = "#D" + pad.throttle() + "," + pad.steer();
+                padPan();
+            }
+        } else if (padSpin != 0)
+            cmd = "#M" + (-padSpin * SPIN) + "," + (padSpin * SPIN);
+        else if (style == STYLE_TANK && (tankL.isActive() || tankR.isActive()))
             cmd = "#M" + tankL.stickY() + "," + tankR.stickY();
         else if (style == STYLE_JOY && joy.isActive())
             cmd = "#D" + joy.stickY() + "," + (-joy.stickX());   // stick right = steer right (negative)
@@ -796,6 +847,109 @@ public class MainActivity extends Activity implements BleLink.Listener {
         }
     }
 
+    // ------------------------------------------------------------------ PS5 gamepad
+
+    @Override public boolean dispatchGenericMotionEvent(MotionEvent e) {
+        if (pad.handleMotion(e)) {
+            if (padDriving && !pad.active()) {   // sticks and triggers released: stop now, like a touch stick
+                padDriving = false;
+                if (padSpin == 0 && !anyStickActive()) { stopBurst = 3; if (link.ready()) link.send("#S"); }
+            }
+            return true;
+        }
+        return super.dispatchGenericMotionEvent(e);
+    }
+
+    @Override public boolean dispatchKeyEvent(KeyEvent e) {
+        return pad.handleKey(e) || super.dispatchKeyEvent(e);
+    }
+
+    @Override public void onPadConnected(String name) {
+        padTile.setVisibility(name != null ? View.VISIBLE : View.GONE);
+        if (name != null) {
+            toast("Đã kết nối tay cầm " + name);
+            padColor();
+            pad.rumble(160, 0, 100, 80, 100);
+            return;
+        }
+        toast("Tay cầm đã ngắt");
+        boolean wasDriving = padDriving || padSpin != 0;
+        padDriving = false;
+        padSpin = 0;
+        horn(false);   // in case Cross was held
+        if (wasDriving) { stopBurst = 3; if (link.ready()) link.send("#S"); }
+    }
+
+    @Override public void onPadButton(int key, boolean down) {
+        switch (key) {
+            case KeyEvent.KEYCODE_BUTTON_A:  horn(down); return;                        // Cross: horn while held
+            case KeyEvent.KEYCODE_BUTTON_L1: padSpinKey(1, down); return;               // L1 / R1: spin on the spot
+            case KeyEvent.KEYCODE_BUTTON_R1: padSpinKey(-1, down); return;
+        }
+        if (!down) return;
+        switch (key) {
+            case KeyEvent.KEYCODE_BUTTON_B:                                             // Circle: STOP, rest pose
+                restPose();
+                pad.rumble(200, 0, 60);
+                break;
+            case KeyEvent.KEYCODE_BUTTON_X: headBtn.performClick(); break;             // Square: headlight
+            case KeyEvent.KEYCODE_BUTTON_Y: setFlash(!camLed); break;                  // Triangle: camera flash
+            case KeyEvent.KEYCODE_DPAD_UP:   selectSpeed(Math.min(2, prefs.getInt("speed", 1) + 1)); break;
+            case KeyEvent.KEYCODE_DPAD_DOWN: selectSpeed(Math.max(0, prefs.getInt("speed", 1) - 1)); break;
+            case KeyEvent.KEYCODE_DPAD_LEFT:  panBar.setProgress(panBar.getProgress() - 20); sendPan(); break;
+            case KeyEvent.KEYCODE_DPAD_RIGHT: panBar.setProgress(panBar.getProgress() + 20); sendPan(); break;
+            case KeyEvent.KEYCODE_BUTTON_THUMBR: panBar.setProgress(80); sendPan(); break;               // R3: camera straight
+            case KeyEvent.KEYCODE_BUTTON_THUMBL: selectStyle(style == STYLE_TANK ? STYLE_JOY : STYLE_TANK); break;   // L3: car / tank
+            case KeyEvent.KEYCODE_BUTTON_START: setRobotMode(robotMode < 0 ? 0 : (robotMode + 1) % MODES); break;   // Options: next mode
+            case KeyEvent.KEYCODE_BUTTON_SELECT: if (!radar.isScanning()) startRadar(); break;                    // Create: radar sweep
+        }
+    }
+
+    private void padSpinKey(int dir, boolean down) {
+        if (down) padSpin = dir;
+        else if (padSpin == dir) {
+            padSpin = 0;
+            if (!pad.active() && !anyStickActive()) { stopBurst = 3; if (link.ready()) link.send("#S"); }
+        }
+    }
+
+    /** Car style: the right stick turns the camera, faster the further it is pushed. */
+    private void padPan() {
+        int x = pad.rightX();
+        if (x == 0 || vision.mode() != Vision.OFF) return;   // tracking owns the camera
+        int p = panBar.getProgress();
+        panBar.setProgress(p + x * 8 / 100);
+        if (panBar.getProgress() != p) sendPan();
+    }
+
+    /** Light bar shows the robot's mode colour; dim while the robot is not connected. */
+    private void padColor() {
+        if (!pad.connected()) return;
+        pad.setColor(!link.ready() || robotMode < 0 ? 0x101830 : MODE_COLORS[robotMode]);
+    }
+
+    private void showPadHelp() {
+        String status = pad.connected() ? "Đang dùng: " + pad.name() + "\n\n" : "Chưa có tay cầm.\n\n";
+        dialog("Tay cầm PS5")
+                .setMessage(status
+                        + "Kết nối: giữ nút PS + Create (nút nhỏ bên trái touchpad) tới khi đèn nháy nhanh, rồi vào Cài đặt Bluetooth "
+                        + "của điện thoại chọn \"DualSense Wireless Controller\". Lần sau chỉ cần bấm nút PS.\n\n"
+                        + "Kiểu Joystick / Nghiêng (lái như ô tô):\n"
+                        + "  R2 tiến · L2 lùi (bóp nhẹ = chậm)\n"
+                        + "  Cần trái: đánh lái (đẩy lên/xuống cũng tiến/lùi)\n"
+                        + "  Cần phải: quay camera\n"
+                        + "Kiểu Hai bên (xe tăng): cần trái = bánh trái, cần phải = bánh phải\n\n"
+                        + "✕ còi · ○ DỪNG · □ đèn pha · △ đèn flash\n"
+                        + "L1 / R1: xoay tại chỗ trái / phải\n"
+                        + "D-pad ↑↓ tốc độ · ←→ quay camera · R3 camera thẳng\n"
+                        + "L3: đổi kiểu lái ô tô ↔ xe tăng\n"
+                        + "Options: chế độ kế tiếp · Create: quét radar\n\n"
+                        + "Thanh đèn tay cầm mang màu chế độ hiện tại. Tay cầm rung khi kết nối robot, khi xe tự phanh "
+                        + "vì vật cản, khi bị kẹt và khi canh gác báo động.")
+                .setPositiveButton("Đóng", null)
+                .show();
+    }
+
     // ------------------------------------------------------------------ link callbacks
 
     @Override public void onLinkState(int state, String message) {
@@ -804,7 +958,9 @@ public class MainActivity extends Activity implements BleLink.Listener {
         linkText.setText(state == BleLink.READY ? "Đã kết nối" : state == BleLink.OFF ? "Ngắt" : "Đang tìm");
         linkText.setTextColor(c);
         linkIcon.getDrawable().setTint(c);
+        padColor();
         if (state == BleLink.READY) {
+            pad.rumble(120, 0, 120);
             sendConfig();
             sendHeadlight();
             sendPan();
@@ -816,6 +972,7 @@ public class MainActivity extends Activity implements BleLink.Listener {
             telemetry.clear();
             showMode(-1);
             robotMode = -1;
+            lastFlags = 0;
         }
     }
 
@@ -839,7 +996,11 @@ public class MainActivity extends Activity implements BleLink.Listener {
         catch (NumberFormatException e) { return; }
         int mode = v[0];
         if (mode < 0 || mode >= MODES) return;
-        robotMode = mode;
+        if (mode != robotMode) { robotMode = mode; padColor(); }
+        int fresh = v[2] & ~lastFlags;
+        lastFlags = v[2];
+        if ((fresh & 0x08) != 0 && mode == 0) pad.rumble(200, 0, 150);    // collision guard braked while driving by hand
+        if ((fresh & 0x80) != 0) pad.rumble(255, 0, 120, 80, 120);         // stuck
         showMode(mode);
         camera.setHud(MODE_HUD[mode], MODE_COLORS[mode], v[1], v[2], mode);
         telemetry.set(v[3], v[4], v[5], v[6]);
@@ -1103,6 +1264,7 @@ public class MainActivity extends Activity implements BleLink.Listener {
         Vibrator vib = getSystemService(Vibrator.class);
         if (vib != null) vib.vibrate(VibrationEffect.createWaveform(new long[] { 0, 400, 200, 400, 200, 700 }, -1));
         if (!camera.isRunning()) startCamera();   // the camera is already turned toward it
+        pad.rumble(255, 0, 400, 200, 400, 200, 700);
 
         Intent open = new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
         Notification.Builder nb = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, ALARM_CHANNEL)
@@ -1308,6 +1470,10 @@ public class MainActivity extends Activity implements BleLink.Listener {
             prefs.edit().putInt("steer_trim", v).apply();   // live preview on the robot
             sendConfig();
         });
+        TextView padLink = Ui.text(this, "Tay cầm PS5  ›", 14, Ui.CYAN, Ui.MEDIUM);
+        padLink.setPadding(0, dp(10), 0, dp(10));
+        padLink.setOnClickListener(v -> showPadHelp());
+        box.addView(padLink, margins(lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT), 0, 10, 0, 0));
         TextView ledLink = Ui.text(this, "Đèn xi-nhan, phanh & bố cục LED  ›", 14, Ui.CYAN, Ui.MEDIUM);
         ledLink.setPadding(0, dp(10), 0, dp(10));
         ledLink.setOnClickListener(v -> showLightsSettings());
